@@ -301,12 +301,49 @@ def local_set(path: str, value):
         node[parts[-1]] = json.loads(json.dumps(value))
 
 
+def web_request(method: str, url: str, params=None, json_body=None, form=None):
+    """Send one web request and wait for the answer. Returns (status code, text).
+
+    In the browser this uses the browser's own XMLHttpRequest. (The requests
+    package crashes the Python engine on iPhone Safari when a button click
+    starts the request.) Outside a browser it uses the requests package.
+    Raises OSError when the server can't be reached.
+    """
+    from urllib.parse import urlencode
+    if params:
+        url = url + "?" + urlencode(params)
+    body = None
+    content_type = ""
+    if json_body is not None:
+        body = json.dumps(json_body)
+        content_type = "application/json"
+    elif form is not None:
+        body = urlencode(form)
+        content_type = "application/x-www-form-urlencoded"
+    if sys.platform == "emscripten":
+        from js import XMLHttpRequest
+        request = XMLHttpRequest.new()
+        request.open(method, url, False)          # False = wait for the answer
+        if content_type:
+            request.setRequestHeader("Content-Type", content_type)
+        try:
+            request.send(body)
+        except Exception:
+            raise OSError("Could not reach the server.")
+        if request.status == 0:
+            raise OSError("Could not reach the server.")
+        return int(request.status), str(request.responseText or "")
+    import requests
+    headers = {"Content-Type": content_type} if content_type else {}
+    try:
+        response = requests.request(method, url, data=body, headers=headers, timeout=15)
+    except Exception:
+        raise OSError("Could not reach the server.")
+    return response.status_code, response.text
+
+
 def firebase_call(method: str, path: str, value=None, params=None):
     """Send one request to the Realtime Database. Returns (data, error)."""
-    try:
-        import requests
-    except ImportError:
-        return None, "The requests package is missing."
     url = FIREBASE_DATABASE_URL.rstrip("/") + "/" + path.strip("/") + ".json"
     for attempt in range(2):
         if not TOKENS["id_token"]:
@@ -315,19 +352,19 @@ def firebase_call(method: str, path: str, value=None, params=None):
         if params:
             query.update(params)
         try:
-            response = requests.request(method, url, params=query, timeout=15,
-                                        json=value if method in ("PUT", "PATCH") else None)
-        except Exception:
+            status, text = web_request(method, url, query,
+                                       value if method in ("PUT", "PATCH") else None)
+        except OSError:
             return None, "Could not reach Firebase. Check your internet connection."
-        if response.status_code == 401 and attempt == 0 and refresh_login():
+        if status == 401 and attempt == 0 and refresh_login():
             continue                       # the login token was renewed; try again
-        if response.status_code in (401, 403):
+        if status in (401, 403):
             return None, "Permission denied by the database rules."
-        if not response.ok:
-            return None, "Database error (" + str(response.status_code) + ")."
+        if status < 200 or status >= 300:
+            return None, "Database error (" + str(status) + ")."
         try:
-            return response.json(), ""
-        except Exception:
+            return json.loads(text), ""
+        except ValueError:
             return None, "Firebase sent back something unexpected."
     return None, "Your login expired. Please sign in again."
 
@@ -412,13 +449,13 @@ AUTH_MESSAGES = {
 def auth_request(action: str, payload: dict):
     """Call Firebase Authentication. Returns (result dict, error message)."""
     try:
-        import requests
-        response = requests.post("https://identitytoolkit.googleapis.com/v1/accounts:" + action,
-                                 params={"key": FIREBASE_API_KEY}, json=payload, timeout=15)
-        result = response.json()
-    except Exception:
+        status, text = web_request("POST",
+                                   "https://identitytoolkit.googleapis.com/v1/accounts:" + action,
+                                   {"key": FIREBASE_API_KEY}, payload)
+        result = json.loads(text)
+    except (OSError, ValueError):
         return {}, "Could not reach Firebase. Check your internet connection."
-    if not response.ok:
+    if status < 200 or status >= 300:
         code = str(result.get("error", {}).get("message", "UNKNOWN"))
         if code.startswith("WEAK_PASSWORD"):
             return {}, "Choose a password with at least 6 characters."
@@ -431,15 +468,13 @@ def refresh_login() -> bool:
     if not TOKENS["refresh_token"]:
         return False
     try:
-        import requests
-        response = requests.post("https://securetoken.googleapis.com/v1/token",
-                                 params={"key": FIREBASE_API_KEY},
-                                 data={"grant_type": "refresh_token",
-                                       "refresh_token": TOKENS["refresh_token"]},
-                                 timeout=15)
-        if not response.ok:
+        status, text = web_request("POST", "https://securetoken.googleapis.com/v1/token",
+                                   {"key": FIREBASE_API_KEY},
+                                   form={"grant_type": "refresh_token",
+                                         "refresh_token": TOKENS["refresh_token"]})
+        if status != 200:
             return False
-        data = response.json()
+        data = json.loads(text)
         TOKENS["id_token"] = data["id_token"]
         TOKENS["refresh_token"] = data["refresh_token"]
         TOKENS["uid"] = data["user_id"]
